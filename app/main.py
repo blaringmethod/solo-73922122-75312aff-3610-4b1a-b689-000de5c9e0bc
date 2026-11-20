@@ -8,7 +8,10 @@
    - 同键异字节 -> 409 拒绝，记录不可改；
    - 超累计上限 -> 409 拒绝；
 3. 每次发布追加一个检查点（条数 + Merkle 根），只增不改；
-4. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用。
+4. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用；
+5. 目录库缺失/空库/半初始化而卷上留有原件 -> 目录故障：/health 报告
+   directory_fault，发布、目录查询、检查点、取件、取证一律 503，
+   且任何请求都不会在卷上补建目录库；恢复原目录库并重启后按原检查点续发。
 """
 from __future__ import annotations
 
@@ -16,13 +19,13 @@ import re
 from contextlib import asynccontextmanager
 from datetime import date
 
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import merkle
 from .config import settings
-from .db import ConflictError, Database
+from .db import ConflictError, Database, DirectoryFaultError
 from .schemas import (
     AppendProofOut,
     CheckpointOut,
@@ -37,6 +40,8 @@ from .storage import BlobError, BlobStore
 blob_store = BlobStore(settings)
 database = Database(settings)
 
+# 启动时判定的目录故障（目录库缺失/空库/半初始化且卷上留有原件）。
+_directory_fault: str | None = database.fault
 # 启动自检结果；发现缺件时拒绝出具任何证明与下载。
 _startup_problems: list[str] = []
 
@@ -44,7 +49,11 @@ _startup_problems: list[str] = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _startup_problems
-    _startup_problems = database.integrity_problems(blob_store.verify_present)
+    if _directory_fault is not None:
+        # 目录故障时无法连接目录库，跳过缺件自检，直接报告目录故障。
+        _startup_problems = [_directory_fault]
+    else:
+        _startup_problems = database.integrity_problems(blob_store.verify_present)
     yield
 
 
@@ -76,7 +85,34 @@ def _validate_identity(station_id: str, sample_date: str, order_no: str) -> None
         raise HTTPException(422, "order_no 须为 1-128 位字母数字及 ._- 字符")
 
 
+def _current_directory_fault() -> str | None:
+    """启动判定 + 运行期自检（库文件被删/卷掉线）的目录故障。"""
+    return _directory_fault or database.runtime_fault()
+
+
+def _require_directory() -> None:
+    """目录查询与检查点的前置门槛：目录故障一律 503。"""
+    fault = _current_directory_fault()
+    if fault:
+        raise HTTPException(
+            503,
+            detail={
+                "message": "目录库故障：目录查询与检查点不可用，请恢复原目录库并重启实例",
+                "fault": fault,
+            },
+        )
+
+
 def _require_healthy() -> None:
+    fault = _current_directory_fault()
+    if fault:
+        raise HTTPException(
+            503,
+            detail={
+                "message": "目录库故障：拒绝发布、取件与取证，请恢复原目录库并重启实例",
+                "fault": fault,
+            },
+        )
     if _startup_problems:
         raise HTTPException(
             503,
@@ -85,6 +121,21 @@ def _require_healthy() -> None:
                 "problems": _startup_problems,
             },
         )
+
+
+@app.exception_handler(DirectoryFaultError)
+async def directory_fault_handler(_request: Request, exc: DirectoryFaultError):
+    # 兜底：任何触库路径在目录库缺失时（如运行期被删）都映射为 503，
+    # 连接层使用 mode=rw，绝不会在卷上补建空库。
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": {
+                "message": "目录库故障，拒绝服务",
+                "fault": str(exc),
+            }
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -145,6 +196,7 @@ async def publish_release(
 # --------------------------------------------------------------------------- #
 @app.get("/releases", response_model=list[ReleaseOut], summary="列出全部发布记录")
 async def list_releases():
+    _require_directory()
     rows = await run_in_threadpool(database.list_releases)
     return [ReleaseOut(**r) for r in rows]
 
@@ -155,6 +207,7 @@ async def list_releases():
     summary="按站号/日期/单号查询发布目录记录",
 )
 async def get_release(station_id: str, sample_date: str, order_no: str):
+    _require_directory()
     record = await run_in_threadpool(
         database.get_release, station_id, sample_date, order_no
     )
@@ -198,6 +251,7 @@ async def download_release(station_id: str, sample_date: str, order_no: str):
     summary="最新检查点（条数 + Merkle 根摘要）",
 )
 async def latest_checkpoint():
+    _require_directory()
     return CheckpointOut(**(await run_in_threadpool(database.latest_checkpoint)))
 
 
@@ -207,6 +261,7 @@ async def latest_checkpoint():
     summary="按条数序号取任意旧检查点",
 )
 async def get_checkpoint(seq: int):
+    _require_directory()
     checkpoint = await run_in_threadpool(database.get_checkpoint, seq)
     if checkpoint is None:
         raise HTTPException(404, f"不存在序号为 {seq} 的检查点")
@@ -219,6 +274,7 @@ async def get_checkpoint(seq: int):
     summary="列出全部检查点（含零号空树检查点）",
 )
 async def list_checkpoints():
+    _require_directory()
     rows = await run_in_threadpool(database.list_checkpoints)
     return [CheckpointOut(**c) for c in rows]
 
@@ -293,7 +349,15 @@ async def append_proof(old_seq: int):
 # --------------------------------------------------------------------------- #
 @app.get("/health", response_model=HealthOut, summary="存储自检与健康状态")
 async def health():
+    fault = _current_directory_fault()
     problems = list(_startup_problems)
+    if fault:
+        if fault not in problems:
+            problems.insert(0, fault)
+        # 目录故障：不触碰目录库（查询不得补建），条数未知。
+        return HealthOut(
+            status="directory_fault", release_count=None, problems=problems
+        )
     rows = await run_in_threadpool(database.list_releases)
     return HealthOut(
         status="ok" if not problems else "degraded",

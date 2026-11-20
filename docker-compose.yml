@@ -1,6 +1,7 @@
 # 河流水质站日 CSV 发布服务：两个实例共享同一卷，验证跨实例并发安全。
 # 启动：docker compose up --build
 # 实例 A 文档：http://localhost:8001/docs   实例 B 文档：http://localhost:8002/docs
+# 目录库丢失/恢复演示：bash scripts/directory_fault_demo.sh
 services:
   release-a:
     build: .
@@ -15,6 +16,8 @@ services:
       - shared-data:/data
     restart: unless-stopped
     healthcheck:
+      # /health 恒返回 200，目录故障体现在 status 字段（directory_fault），
+      # 实例保持运行以便演示 503 与恢复，编排层如需摘除可解析该字段。
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       timeout: 5s
@@ -42,3 +45,5 @@ services:
 
 volumes:
   shared-data:
+    # 固定卷名，便于演示脚本用辅助容器备份/删除/恢复卷上的 release.db。
+    name: water-quality-shared-data

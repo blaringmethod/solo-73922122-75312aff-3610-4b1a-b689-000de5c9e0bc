@@ -10,15 +10,17 @@
 app/
   config.py     运行配置（DATA_DIR、1 MiB、128 件、树深度 7）
   storage.py    原件字节存储：内容寻址 + 临时文件 fsync + 原子改名
-  db.py         SQLite 持久层：WAL、BEGIN IMMEDIATE 串行化、启动自检
+  db.py         SQLite 持久层：WAL、BEGIN IMMEDIATE 串行化、目录库安全打开/初始化、启动自检
   merkle.py     Merkle 树纯函数：根、纳入证明、追加证明、离线验证
   verify.py     离线核验函数与 CLI（python -m app.verify ...）
   schemas.py    HTTP 响应模型
   main.py       FastAPI 路由（阻塞调用均走线程池）
-tests/          22 项 pytest 用例（算法、API、故障路径）
+tests/          35 项 pytest 用例（算法、API、故障路径、目录库生命周期）
 scripts/
-  demo.sh                 HTTP 端到端演示
-  dual_instance_check.py  双进程共卷并发/故障转移集成检查
+  demo.sh                    HTTP 端到端演示
+  dual_instance_check.py     双进程共卷并发/故障转移集成检查
+  directory_fault_check.py   目录库丢失/恢复生命周期双进程集成检查
+  directory_fault_demo.sh    Docker Compose 目录库丢失/恢复演示
 Dockerfile
 docker-compose.yml        两个实例共卷，端口 8001/8002
 ```
@@ -58,7 +60,33 @@ DATA_DIR=./data uvicorn app.main:app --port 8000
 | GET | `/checkpoints/latest` | 最新检查点（条数 + Merkle 根） |
 | GET | `/checkpoints/{seq}` | 任意旧检查点 |
 | GET | `/checkpoints/{old_seq}/append-proof` | 旧检查点 → 最新检查点的追加证明 |
-| GET | `/health` | 启动自检结果（缺件/摘要不符时 `degraded`，并拒发证明与下载） |
+| GET | `/health` | 健康状态：`ok` / `degraded`（缺件）/ `directory_fault`（目录库故障） |
+
+### 目录库故障（directory_fault）
+
+共享卷上留有原件、但目录库 `release.db` 缺失、仅剩未建表的空库或半初始化时，
+实例**拒绝自动重建**（否则会以空目录从 1 号重发，掩盖目录丢失）：
+
+* `/health` 返回 `status="directory_fault"`（HTTP 200，`release_count=null`）；
+* 发布、目录查询、检查点、取件、取证**一律 503**；
+* 任何请求都不会在卷上补建目录库，原件与残留库文件原样保留；
+* 恢复原 `release.db` 并重启实例后，按原检查点续发（序号连续）；
+* 运行中的实例在目录库恢复后自动恢复服务，无需重启。
+
+全新卷（卷上无任何原件）则允许建库：双实例同时启动时在 `.init.lock`
+文件锁内串行判定，库在临时文件中建好完整模式（三张表 + `schema_version`
+标记 + 零号检查点）后 `os.replace` 原子生效；建库中断只留临时文件，
+下次启动自动清理重试；半初始化残库改名留证（`release.db.half-init-*`），
+绝不用于发布或供数。已有完整目录的旧卷即使留有未登记原件也照常使用。
+
+Docker Compose 一键演示上述故障报告与恢复续发：
+
+```bash
+docker compose up -d --build          # 或直接用演示脚本全流程：
+bash scripts/directory_fault_demo.sh  # 备份/删除/恢复卷上 release.db 并逐段验证
+```
+
+无 Docker 环境可运行等价的双进程集成检查：`python scripts/directory_fault_check.py`。
 
 ## 4. 核验模型（科研组离线使用）
 
@@ -95,28 +123,42 @@ python -m app.verify append --proof append.json \
 3. **只增不改**：同键同字节复用、同键异字节 409；检查点与记录均只追加。
 4. **启动自检**：重算全部叶子与根，逐件校验卷上原件摘要并检查序号稠密、检查点连续；
    发现缺件即 `degraded`，拒绝发布/证明/下载，绝不输出缺件记录。
-5. **重启有效**：历史检查点根由固定深度树确定，重启后逐点复算一致，留存证明持续有效。
-6. 阻塞式磁盘/DB 调用均在任意线程池执行，锁等待不阻塞事件循环；
+5. **目录库安全打开**：运行期连接一律 `mode=rw`，库文件缺失即报错，任何查询都不补建空库；
+   有原件的卷遇上缺失/空库/半初始化目录库即 `directory_fault`，数据面全 503，
+   恢复原目录库并重启后按原检查点续发；仅全新卷（无原件）允许原子建库且可重试。
+6. **重启有效**：历史检查点根由固定深度树确定，重启后逐点复算一致，留存证明持续有效。
+7. 阻塞式磁盘/DB 调用均在任意线程池执行，锁等待不阻塞事件循环；
    写锁冲突在 `busy_timeout` 之外另有 3 次有限重试。
 
 ## 6. 测试结果（本环境实测）
 
-* `pytest tests/`：**22 项全部通过**
+* `pytest tests/`：**35 项全部通过**
   - Merkle：根稳定性、纳入证明、全部前缀追加证明、篡改/重放/重叠/缺口拒绝、平铺覆盖性质；
   - API：发布、幂等复用、409 冲突、413/422 限额与校验、128 上限、下载字节一致、两类证明与离线核验；
-  - 故障：写盘失败不留记录且可重试、缺件自检与 503 拒服、孤立临时/原件无害、已引用原件被改可检出、重启后检查点可复算。
+  - 故障：写盘失败不留记录且可重试、缺件自检与 503 拒服、孤立临时/原件无害、已引用原件被改可检出、重启后检查点可复算；
+  - 目录库生命周期：全新卷建库/重开、双线程并发首建恰一次、中断残留自动清理重试、
+    半初始化库无原件时改名留证重建、丢库/空库/无表库/半初始化库且有原件时目录故障且不补建不改写、
+    完整目录+未登记原件照常使用、恢复原库后按原检查点续发（id 3 续接）、运行期丢库不补建、
+    目录故障时应用层全部数据面 503 且 /health 报 `directory_fault`。
 * `scripts/dual_instance_check.py`（两个独立 uvicorn 进程共卷）：**16 项全部通过**，
   覆盖并发同单（一写一复用）、10 件并发异单序号 1..11 稠密、跨实例取件/检查点/证明、
   第三进程挂同卷的故障转移视角与继续追加。
+* `scripts/directory_fault_check.py`（多进程共卷模拟目录库丢失/恢复）：**59 项全部通过**，
+  覆盖双实例同时首建全新卷、丢库后运行中双实例与新实例 /health 报 `directory_fault`、
+  发布/目录/检查点/取件/取证全 503、卷上不补建且原件原样、恢复原库后新实例按原检查点
+  续发 id=3 且根一致、运行中实例自动恢复、全新卷半初始化库重建可发布、
+  有原件半初始化库故障且残库原件原样保留。
 * 手工冒烟（默认 1 MiB / 128 件 / 深度 7）：1 MiB+1 返回 413、恰 1 MiB 成功、
   发满 128 件后第 129 件 409、检查点 0..128 连续、离线 CLI 核验通过、篡改原件被拒。
 * 证明规模实测：纳入证明恒 7 步；追加证明最大条目随条数 1→2→3→…→8（对数增长）。
 
 ## 7. 剩余工作与已知限制（据实说明）
 
-1. **本环境无 Docker 守护进程**，`docker compose` 未实际起容器验证；已用双 uvicorn
-   进程共享同一 `DATA_DIR` 做等价并发/故障转移测试。Dockerfile 与 compose 配置已交付，
-   需在具备 Docker 的环境执行一次 `docker compose up --build` 复核。
+1. **本环境无 Docker 守护进程**，`docker compose` 与 `scripts/directory_fault_demo.sh`
+   未实际起容器验证；已用多 uvicorn 进程共享同一 `DATA_DIR` 做等价并发/故障/恢复测试
+   （`dual_instance_check.py`、`directory_fault_check.py` 全绿）。Dockerfile、compose
+   与演示脚本已交付，需在具备 Docker 的环境执行一次 `docker compose up --build` 与
+   `bash scripts/directory_fault_demo.sh` 复核。
 2. 沙箱以 seccomp 禁止 `kill` 系统调用，集成脚本无法终止演示进程，改为随机端口 +
    每次独立临时目录；脚本中的“重启”以第三进程挂同卷模拟（故障转移语义等价）。
 3. 128 件上限在实现上是固定深度树的叶子槽位数（2 的幂，可经 `MAX_RELEASES` 调整）；

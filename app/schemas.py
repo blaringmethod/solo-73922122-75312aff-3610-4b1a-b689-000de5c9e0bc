@@ -57,8 +57,12 @@ class AppendProofOut(BaseModel):
 
 
 class HealthOut(BaseModel):
-    status: str
-    release_count: int
+    status: str = Field(
+        ..., description="ok / degraded（缺件）/ directory_fault（目录库故障）"
+    )
+    release_count: int | None = Field(
+        ..., description="目录故障时无法读取目录库，为 null"
+    )
     problems: list[str]
 
 
